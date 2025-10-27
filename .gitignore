@@ -1,0 +1,9 @@
+# freesurfer license file
+license.txt
+
+# data
+sourcedata
+
+# outputs
+preprocessed
+logs
