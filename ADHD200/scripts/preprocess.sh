@@ -14,13 +14,10 @@ datadir="${PWD}/sourcedata/RawDataBIDS/${dataset}"
 outdir="${PWD}/preprocessed/fmriprep/${dataset}"
 logdir="${PWD}/logs/fmriprep"
 
-fs_license=$(readlink -f ../license.txt)
-
+fs_license=$(readlink -f ../resources/license.txt)
 # we need to separately mount a shared fsaverage directory, otherwise there is a race
 # https://github.com/nipreps/fmriprep/issues/3492
-fsavgdir="${PWD}/sourcedata/fsaverage"
-
-export OMP_NUM_THREADS=1
+fsavgdir=$(readlink -f ../resources/fsaverage)
 
 mkdir -p $outdir 2>/dev/null
 mkdir -p $logdir 2>/dev/null
@@ -30,7 +27,6 @@ docker run --rm \
     -v "${outdir}:/out" \
     -v "${fsavgdir}:/out/sourcedata/freesurfer/fsaverage:ro" \
     -v "${fs_license}:/opt/freesurfer/license.txt:ro" \
-    -e OMP_NUM_THREADS=$OMP_NUM_THREADS \
     nipreps/fmriprep:25.2.3 \
     /data /out participant \
     --participant-label $subid \
@@ -40,5 +36,5 @@ docker run --rm \
     --output-spaces MNI152NLin6Asym:res-2 \
     --cifti-output 91k \
     --nprocs 1 \
-    --omp-nthreads $OMP_NUM_THREADS \
-    2>&1 | tee ${logdir}/${dataset}_${subid}.txt
+    --omp-nthreads 1 \
+    2>&1 | tee -a ${logdir}/${dataset}_${subid}.txt
