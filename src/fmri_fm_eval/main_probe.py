@@ -17,21 +17,19 @@ from typing import Iterable, Sequence
 
 import numpy as np
 import pandas as pd
+import sklearn.metrics
+import sklearn.utils
 import torch
 import torch.nn as nn
 import wandb
 from cloudpathlib import S3Path
 from omegaconf import DictConfig, OmegaConf
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, WeightedRandomSampler
 
 import fmri_fm_eval.utils as ut
-from fmri_fm_eval.heads import (
-    ClassifierGrid,
-    LinearClassifier,
-    AttnPoolClassifier,
-    MLPClassifier,
-    pool_representation,
-)
+import fmri_fm_eval.version
+from fmri_fm_eval.classifiers import ClassifierGrid, create_classifier, list_classififiers
+from fmri_fm_eval.datasets.base import HFDataset
 from fmri_fm_eval.models.registry import create_model, list_models
 from fmri_fm_eval.datasets.registry import create_dataset, list_datasets
 
@@ -46,7 +44,10 @@ def main(args: DictConfig):
     ut.random_seed(args.seed)
 
     if not args.get("name"):
-        args.name = f"{args.name_prefix}/{args.model}/{args.representation}/{args.dataset}"
+        args.name = (
+            f"{args.name_prefix}/"
+            f"{args.model}/{args.representation}__{args.classifier}/{args.dataset}"
+        )
     args.output_dir = f"{args.output_root}/{args.name}"
     output_dir = Path(args.output_dir)
 
@@ -78,9 +79,10 @@ def main(args: DictConfig):
     ut.setup_for_distributed(log_path=output_dir / "log.txt")
 
     print("fMRI foundation model probe eval")
-    print(f"start: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    print(f"cwd: {Path.cwd()}")
+    print(f"version: {fmri_fm_eval.version.__version__}")
     print(ut.get_sha())
+    print(f"cwd: {Path.cwd()}")
+    print(f"start: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print("config:", OmegaConf.to_yaml(args), sep="\n")
 
     # backbone model
@@ -95,39 +97,56 @@ def main(args: DictConfig):
     dataset_dict = create_dataset(
         args.dataset, space=backbone.__space__, **(args.dataset_kwargs or {})
     )
-    args.num_classes = dataset_dict["train"].__num_classes__
-    args.task = dataset_dict["train"].__task__
     for split, ds in dataset_dict.items():
         print(f"{split} (n={len(ds)}):\n{ds}\n")
+    train_dataset: HFDataset = dataset_dict["train"]
+    args.num_classes = train_dataset.num_classes
 
     if hasattr(transform, "fit"):
         print("fitting transform on training dataset")
-        transform.fit(dataset_dict["train"])
+        transform.fit(train_dataset)
 
     for split, ds in dataset_dict.items():
         ds.set_transform(transform)
 
-    loaders_dict = {}
+    # balanced class sampling for imbalanced classes
+    if args.balanced_sampling:
+        weights = 1 / (train_dataset.label_counts / train_dataset.label_counts.max())
+        print(f"sampling with balanced class weights: {np.round(weights, 2)}")
+        weights = weights[train_dataset.target_ids]
+        train_sampler = WeightedRandomSampler(weights, num_samples=len(train_dataset))
+    else:
+        train_sampler = None
+
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=args.batch_size,
+        shuffle=train_sampler is None,
+        sampler=train_sampler,
+        num_workers=args.num_workers,
+        prefetch_factor=args.prefetch_factor if args.num_workers else None,
+        drop_last=True,
+    )
+
+    eval_loaders_dict = {}
     for split, dataset in dataset_dict.items():
-        loaders_dict[split] = DataLoader(
+        eval_loaders_dict[split] = DataLoader(
             dataset,
             batch_size=args.batch_size,
-            shuffle=split == "train",
+            shuffle=False,
             num_workers=args.num_workers,
-            prefetch_factor=args.prefetch_factor,
+            prefetch_factor=args.prefetch_factor if args.num_workers else None,
+            drop_last=False,
         )
-    # we could also support more splits or different split names, but for now can keep
-    # things simple.
-    train_loader = loaders_dict["train"]
-    val_loader = loaders_dict["validation"]
+    val_loader = eval_loaders_dict["validation"]
 
     # prediction heads
-    print("running backbone on example batch to get embedding shape")
-    embed_shape = get_embedding_shape(backbone, args.representation, dataset_dict["train"], device)
-    print(f"embedding feature shape ({args.representation}): {embed_shape}")
+    print("running backbone on example batch to get embedding dim")
+    embed_dim = get_embedding_dim(args, backbone, train_dataset, device)
+    print(f"embedding feature dim ({args.representation}): {embed_dim}")
 
     print("initializing sweep of classifier heads")
-    classifiers, param_groups = make_classifiers(args, embed_shape, args.num_classes)
+    classifiers, param_groups = make_classifiers(args, embed_dim)
     model = ClassifierGrid(backbone, args.representation, classifiers)
     model.to(device)
     print(f"classifiers:\n{model.classifiers}")
@@ -169,15 +188,10 @@ def main(args: DictConfig):
     if ckpt_meta is not None:
         best_info = ckpt_meta["best_info"]
     else:
-        best_info = {"loss": float("inf")}
+        best_info = {"score": float("-inf")}
 
     # training loss
-    if args.task == "classification":
-        criterion = nn.CrossEntropyLoss(reduction="none")
-    elif args.task == "regression":
-        criterion = nn.MSELoss(reduction="none")
-    else:
-        raise ValueError(f"Unknown task: {args.task}.")
+    criterion = nn.CrossEntropyLoss(reduction="none")
 
     print(f"start training for {args.epochs} epochs")
     log_wandb = args.wandb and ut.is_main_process()
@@ -194,7 +208,7 @@ def main(args: DictConfig):
             device,
         )
 
-        val_stats = evaluate(
+        val_stats, _, _ = evaluate(
             args,
             model,
             criterion,
@@ -207,10 +221,18 @@ def main(args: DictConfig):
         if log_wandb:
             wandb.log(val_stats, (epoch + 1) * args.steps_per_epoch)
 
-        hparam_id, hparam, loss = get_best_hparams(model, val_stats)
+        hparam_id, hparam, cv_score = get_best_hparams(args, model, val_stats)
         hparam_fmt = format_hparam(hparam_id, hparam)
+        hparam_scores = {
+            metric: val_stats[f"validation/{metric}_{hparam_fmt}"]
+            for metric in ["loss"] + args.metrics
+        }
+        hparam_scores_fmt = "  ".join(
+            f"{metric}: {score:.3f}" for metric, score in hparam_scores.items()
+        )
         print(
-            f"cv: [{epoch}]  best hparam: {hparam} ({hparam_id:03d}) ('{hparam_fmt}')  loss: {loss:.3f}"
+            f"cv: [{epoch}]  best hparam: {hparam} ({hparam_id:03d}) ('{hparam_fmt}')  "
+            f"{hparam_scores_fmt}"
         )
 
         best_stats = {
@@ -218,10 +240,9 @@ def main(args: DictConfig):
             "lr_best": hparam[0] * args.lr,
             "wd_best": hparam[1] * args.weight_decay,
             "train/loss_best": train_stats[f"train/loss_{hparam_fmt}"],
-            "validation/loss_best": val_stats[f"validation/loss_{hparam_fmt}"],
         }
-        if args.task == "classification":
-            best_stats["validation/acc1_best"] = val_stats[f"validation/acc1_{hparam_fmt}"]
+        for metric, score in hparam_scores.items():
+            best_stats[f"validation/{metric}_best"] = score
 
         if log_wandb:
             wandb.log(best_stats, (epoch + 1) * args.steps_per_epoch)
@@ -230,8 +251,13 @@ def main(args: DictConfig):
         with (output_dir / "train_log.json").open("a") as f:
             print(json.dumps(merged_stats), file=f)
 
-        if loss < best_info["loss"]:
-            best_info = {"loss": loss, "hparam": hparam, "hparam_id": hparam_id, "epoch": epoch}
+        if cv_score > best_info["score"]:
+            best_info = {
+                "score": cv_score,
+                "hparam": hparam,
+                "hparam_id": hparam_id,
+                "epoch": epoch,
+            }
             is_best = True
         else:
             is_best = False
@@ -262,7 +288,8 @@ def main(args: DictConfig):
 
     header = {
         "model": args.model,
-        "representation": args.representation,
+        "repr": args.representation,
+        "clf": args.classifier,
         "dataset": args.dataset,
         "epoch": best_info["epoch"],
         "lr": hparam[0] * args.lr,
@@ -278,8 +305,8 @@ def main(args: DictConfig):
     }
     table = []
 
-    for split, loader in loaders_dict.items():
-        stats = evaluate(
+    for split, loader in eval_loaders_dict.items():
+        stats, preds, targets = evaluate(
             args,
             model,
             criterion,
@@ -290,11 +317,17 @@ def main(args: DictConfig):
         )
         record = {**header, "split": split}
 
+        preds = preds[:, hparam_id]
+        bootstrap_result = bootstrap_ci(args, preds, targets)
+
         record["loss"] = eval_stats[f"eval/{split}/loss"] = stats[f"{split}/loss_{hparam_fmt}"]
-        if args.task == "classification":
-            record["acc1"] = eval_stats[f"eval/{split}/acc1"] = stats[f"{split}/acc1_{hparam_fmt}"]
+        for metric in args.metrics:
+            score = stats[f"{split}/{metric}_{hparam_fmt}"]
+            record[metric] = eval_stats[f"eval/{split}/{metric}"] = score
+            record[f"{metric}_std"] = bootstrap_result[metric]["std"]
 
         table.append(record)
+        np.savez(output_dir / f"preds_{split}.npz", preds=preds, targets=targets)
 
     table = pd.DataFrame.from_records(table)
     table_fmt = table.to_markdown(index=False, floatfmt=".5g")
@@ -316,9 +349,9 @@ def main(args: DictConfig):
 
 
 @torch.inference_mode()
-def get_embedding_shape(
+def get_embedding_dim(
+    args: DictConfig,
     backbone: nn.Module,
-    representation: str,
     dataset: torch.utils.data.Dataset,
     device: torch.device,
 ):
@@ -327,46 +360,24 @@ def get_embedding_shape(
     example_batch = ut.send_data(example_batch, device)
 
     cls_embeds, reg_embeds, patch_embeds = backbone(example_batch)
-    pooled = pool_representation(
-        cls_embeds, reg_embeds, patch_embeds, representation=representation
-    )
-    embed_shape = tuple(pooled.shape[1:])
-    return embed_shape
+    all_embeds = {"cls": cls_embeds, "reg": reg_embeds, "patch": patch_embeds}
+    embeds = all_embeds[args.representation]
+    embed_dim = embeds.shape[-1]
+    return embed_dim
 
 
-def make_classifiers(
-    args: DictConfig,
-    embed_shape: tuple[int, ...],
-    num_classes: int,
-):
+def make_classifiers(args: DictConfig, embed_dim: int):
     # create sweep of classifier heads with varying hparams
     all_classifiers = {}
     param_groups = {}
 
-    assert len(embed_shape) in {1, 2}
-
-    if len(embed_shape) == 1:
-        clf_fn = partial(LinearClassifier, embed_shape[-1], num_classes)
-    else:
-        sequence_clf = args.get("sequence_classifier", "attn_pool")
-        if sequence_clf == "attn_pool":
-            clf_fn = partial(
-                AttnPoolClassifier,
-                embed_shape[-1],
-                num_classes,
-                embed_dim=args.get("attn_pool_embed_dim"),
-            )
-        elif sequence_clf == "mlp":
-            clf_fn = partial(
-                MLPClassifier,
-                embed_shape[-1],
-                num_classes,
-                hidden_dim=args.get("mlp_hidden_dim"),
-                num_layers=args.get("mlp_layers", 1),
-                dropout=args.get("mlp_dropout", 0.5),
-            )
-        else:
-            raise ValueError(f"Unknown sequence classifier: {sequence_clf}")
+    clf_fn = partial(
+        create_classifier,
+        name=args.classifier,
+        in_dim=embed_dim,
+        out_dim=args.num_classes,
+        **(args.classifier_kwargs or {}),
+    )
 
     # all classifiers get same init
     init_state = None
@@ -446,12 +457,6 @@ def train_one_epoch(
             ut.update_lr(optimizer.param_groups, lr)
 
         target = batch.pop("target")
-
-        # handle single target regression
-        # predictions are always shape [batch_size, num_targets, num_classifiers], so
-        # need to match second dimension.
-        if args.task == "regression" and target.ndim == 1:
-            target = target.unsqueeze(-1)
 
         # expand last dimension of target to match prediction
         # note that the num_classifiers dimension has to go at the end bc this is
@@ -544,7 +549,7 @@ def evaluate(
 
     num_classifiers = len(model.classifiers)
 
-    preds = []
+    logits = []
     targets = []
 
     for batch_idx, batch in enumerate(
@@ -553,50 +558,65 @@ def evaluate(
         batch = ut.send_data(batch, device)
         target = batch.pop("target")
 
-        if args.task == "regression" and target.ndim == 1:
-            target = target.unsqueeze(-1)
         expand_shape = target.ndim * (-1,) + (num_classifiers,)
         target = target.unsqueeze(-1).expand(*expand_shape)
 
         with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=args.amp):
-            pred = model(batch)
+            logit = model(batch)
 
-        preds.append(pred.cpu().float())
+        logits.append(logit.cpu().float())
         targets.append(target.cpu())
 
         if use_cuda:
             torch.cuda.synchronize()
 
     # average loss and acc over the full eval dataset
-    preds = torch.cat(preds)
+    logits = torch.cat(logits)
     targets = torch.cat(targets)
 
-    total_loss = criterion(preds, targets)
+    total_loss = criterion(logits, targets)
     total_loss = total_loss.reshape(-1, num_classifiers).mean(dim=0).tolist()
-    if args.task == "classification":
-        total_acc1 = [
-            ut.accuracy(preds[:, :, ii], targets[:, ii])[0].item() for ii in range(num_classifiers)
-        ]
+    stats = {
+        f"loss_{format_hparam(ii, hparam)}": total_loss[ii]
+        for ii, hparam in enumerate(model.hparams)
+    }
 
-    stats = {}
-    stats.update(
-        {
-            f"loss_{format_hparam(ii, hparam)}": total_loss[ii]
-            for ii, hparam in enumerate(model.hparams)
-        }
-    )
-    if args.task == "classification":
-        stats.update(
-            {
-                f"acc1_{format_hparam(ii, hparam)}": total_acc1[ii]
-                for ii, hparam in enumerate(model.hparams)
-            }
-        )
+    preds = torch.argmax(logits, dim=1).numpy()  # [N, nc]
+    targets = targets[:, 0].numpy()  # drop repeated targets [N]
+
+    for metric in args.metrics:
+        metric_fn = METRICS[metric]
+        for ii, hparam in enumerate(model.hparams):
+            stats[f"{metric}_{format_hparam(ii, hparam)}"] = metric_fn(targets, preds[:, ii])
 
     stats = {f"{eval_name}/{k}": v for k, v in stats.items()}
 
-    # TODO: return preds and targets to compute metrics offline?
-    return stats
+    return stats, preds, targets
+
+
+def bootstrap_ci(args: DictConfig, preds: np.ndarray, targets: np.ndarray):
+    random_state = sklearn.utils.check_random_state(args.seed)
+
+    sample_scores = defaultdict(list)
+    for _ in range(500):
+        preds_, targets_ = sklearn.utils.resample(
+            preds, targets, random_state=random_state, stratify=targets
+        )
+        for metric in args.metrics:
+            metric_fn = METRICS[metric]
+            sample_scores[metric].append(metric_fn(targets_, preds_))
+
+    result = {}
+    for metric, values in sample_scores.items():
+        result[metric] = {"mean": np.mean(values), "std": np.std(values)}
+
+    return result
+
+
+METRICS = {
+    "acc": sklearn.metrics.accuracy_score,
+    "f1": partial(sklearn.metrics.f1_score, average="macro"),
+}
 
 
 def format_hparam(idx: int, hparam: tuple[float, float]) -> str:
@@ -604,15 +624,21 @@ def format_hparam(idx: int, hparam: tuple[float, float]) -> str:
     return f"{idx:03d}_lr{lr:.1e}_wd{weight_decay:.1e}"
 
 
-def get_best_hparams(model: ClassifierGrid, stats: dict[str, float]):
-    losses = [
-        stats[f"validation/loss_{format_hparam(ii, hparam)}"]
+def get_best_hparams(args: DictConfig, model: ClassifierGrid, stats: dict[str, float]):
+    metric = args.cv_metric
+    if metric.startswith("neg_"):
+        sign = -1
+        metric = metric[4:]
+    else:
+        sign = 1
+    scores = [
+        sign * stats[f"validation/{metric}_{format_hparam(ii, hparam)}"]
         for ii, hparam in enumerate(model.hparams)
     ]
-    best_id = int(np.argmin(losses))
+    best_id = int(np.argmax(scores))
     best_hparam = model.hparams[best_id]
-    best_loss = losses[best_id]
-    return best_id, best_hparam, best_loss
+    best_score = scores[best_id]
+    return best_id, best_hparam, best_score
 
 
 def save_model(args, epoch, model, optimizer, meta=None, is_best=None):
@@ -660,6 +686,12 @@ if __name__ == "__main__":
         type=str,
         help=f"[{', '.join(list_models())}]",
     )
+    parser.add_argument("representation", type=str, help="[cls, reg, patch]")
+    parser.add_argument(
+        "classifier",
+        type=str,
+        help=f"[{', '.join(list_classififiers())}]",
+    )
     parser.add_argument(
         "dataset",
         type=str,
@@ -674,5 +706,7 @@ if __name__ == "__main__":
     if args.overrides:
         cfg = OmegaConf.unsafe_merge(cfg, OmegaConf.from_dotlist(args.overrides))
     cfg.model = args.model
+    cfg.representation = args.representation
+    cfg.classifier = args.classifier
     cfg.dataset = args.dataset
     main(cfg)
